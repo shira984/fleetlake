@@ -1,0 +1,105 @@
+# fleetlake: local Iceberg lakehouse for synthetic connected-vehicle telemetry.
+# Object storage (SeaweedFS, S3 API) + Iceberg JDBC catalog (Postgres) + Trino + Prefect.
+
+x-pg-env: &pg-env
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+services:
+  # S3-compatible object storage. SeaweedFS stands in for S3 (MinIO no longer ships images).
+  s3:
+    image: chrislusf/seaweedfs:4.50
+    command: server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=8333
+    environment:
+      # SeaweedFS falls back to these as admin credentials when no S3 config file is given.
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+    ports:
+      - "127.0.0.1:9000:8333"   # S3 API
+    volumes:
+      - s3-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8333"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: create the warehouse bucket, then exit.
+  s3-init:
+    image: amazon/aws-cli:2.39.0
+    depends_on:
+      s3:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      AWS_DEFAULT_REGION: us-east-1
+      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+    entrypoint: >
+      /bin/sh -c "
+      aws --endpoint-url http://s3:8333 s3api head-bucket --bucket $${WAREHOUSE_BUCKET} 2>/dev/null ||
+      aws --endpoint-url http://s3:8333 s3api create-bucket --bucket $${WAREHOUSE_BUCKET}
+      "
+    restart: "no"
+
+  # Holds the Iceberg JDBC catalog (iceberg_catalog db) and Prefect's metadata (prefect db).
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      <<: *pg-env
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  trino:
+    image: trinodb/trino:476
+    depends_on:
+      postgres:
+        condition: service_healthy
+      s3-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *pg-env
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+    ports:
+      - "127.0.0.1:8085:8080"
+    volumes:
+      - ./infra/trino/catalog:/etc/trino/catalog:ro
+    mem_limit: 3g
+    healthcheck:
+      test: ["CMD-SHELL", "trino --execute 'SELECT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  prefect-server:
+    image: prefecthq/prefect:3-python3.11
+    command: prefect server start --host 0.0.0.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/prefect
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"
+      PREFECT_UI_API_URL: http://localhost:4200/api
+    ports:
+      - "127.0.0.1:4200:4200"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  s3-data:
+  pg-data:
