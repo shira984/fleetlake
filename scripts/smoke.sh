@@ -1,31 +1,38 @@
 #!/usr/bin/env bash
 # End-to-end wiring check: Trino -> JDBC catalog (Postgres) -> Parquet files in S3 (SeaweedFS).
 # Creates a throwaway table, writes, reads, inspects Iceberg metadata, then drops it.
+# Statements are batched so the Trino CLI JVM starts only three times.
 set -euo pipefail
 
-# The Trino CLI warns about a missing TTY on every call; drop that noise, keep real errors.
-trino() { docker compose exec -T trino trino --output-format=TSV --execute "$1" 2> >(grep -vE "jline|dumb terminal" >&2); }
+# Pipe SQL on stdin into one CLI call. The CLI warns about a missing TTY; drop that noise, keep real errors.
+trino() { docker compose exec -T trino trino --output-format=TSV 2> >(grep -vE "jline|dumb terminal" >&2); }
 
-echo "-> create schema + table"
-trino "CREATE SCHEMA IF NOT EXISTS iceberg.smoke"
-trino "DROP TABLE IF EXISTS iceberg.smoke.ping"
-trino "CREATE TABLE iceberg.smoke.ping (id INTEGER, ts TIMESTAMP(6)) WITH (partitioning = ARRAY['day(ts)'])"
+cleanup() {
+  trino <<'SQL' >/dev/null 2>&1 || true
+DROP TABLE IF EXISTS iceberg.smoke.ping;
+DROP SCHEMA IF EXISTS iceberg.smoke;
+SQL
+}
+trap cleanup EXIT
 
-echo "-> write"
-trino "INSERT INTO iceberg.smoke.ping VALUES (1, TIMESTAMP '2026-01-01 10:00:00'), (2, TIMESTAMP '2026-01-02 10:00:00')"
+echo "-> create, write"
+trino <<'SQL' >/dev/null
+CREATE SCHEMA IF NOT EXISTS iceberg.smoke;
+DROP TABLE IF EXISTS iceberg.smoke.ping;
+CREATE TABLE iceberg.smoke.ping (id INTEGER, ts TIMESTAMP(6)) WITH (partitioning = ARRAY['day(ts)']);
+INSERT INTO iceberg.smoke.ping VALUES (1, TIMESTAMP '2026-01-01 10:00:00'), (2, TIMESTAMP '2026-01-02 10:00:00');
+SQL
 
-echo "-> read"
-rows=$(trino "SELECT count(*) FROM iceberg.smoke.ping")
+echo "-> read + Iceberg metadata"
+read -r rows snapshots files < <(trino <<'SQL'
+SELECT
+  (SELECT count(*) FROM iceberg.smoke.ping),
+  (SELECT count(*) FROM iceberg.smoke."ping$snapshots"),
+  (SELECT count(*) FROM iceberg.smoke."ping$files");
+SQL
+)
+echo "   rows=$rows snapshots=$snapshots data_files=$files"
 [ "$rows" = "2" ] || { echo "expected 2 rows, got: $rows" >&2; exit 1; }
+[ "$files" = "2" ] || { echo "expected 2 data files (one per day partition), got: $files" >&2; exit 1; }
 
-echo "-> Iceberg metadata"
-snapshots=$(trino "SELECT count(*) FROM iceberg.smoke.\"ping\$snapshots\"")
-files=$(trino "SELECT count(*) FROM iceberg.smoke.\"ping\$files\"")
-echo "   snapshots=$snapshots data_files=$files (one file per day partition)"
-[ "$files" = "2" ] || { echo "expected 2 data files, got: $files" >&2; exit 1; }
-
-echo "-> cleanup"
-trino "DROP TABLE iceberg.smoke.ping"
-trino "DROP SCHEMA iceberg.smoke"
-
-echo "smoke OK"
+echo "smoke OK (cleanup runs on exit)"

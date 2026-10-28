@@ -14,20 +14,20 @@ env:
 up: env
 	docker compose up -d --wait
 
-down:
+down: env
 	docker compose down
 
-nuke:
+nuke: env
 	docker compose down -v
 
-ps:
+ps: env
 	docker compose ps
 
-logs:
+logs: env
 	docker compose logs -f --tail=100
 
-smoke:
+smoke: env
 	./scripts/smoke.sh
 
-trino-cli:
+trino-cli: env
 	docker compose exec trino trino --catalog iceberg

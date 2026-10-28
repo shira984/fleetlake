@@ -1,44 +1,56 @@
 # fleetlake: local Iceberg lakehouse for synthetic connected-vehicle telemetry.
 # Object storage (SeaweedFS, S3 API) + Iceberg JDBC catalog (Postgres) + Trino + Prefect.
+#
+# Every variable is required (`:?`), so running compose without a .env fails loudly
+# instead of starting with empty passwords. Run `make env` (or `make up`) first.
 
 x-pg-env: &pg-env
-  POSTGRES_USER: ${POSTGRES_USER}
-  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_USER: ${POSTGRES_USER:?missing, run make env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing, run make env}
+
+x-s3-creds: &s3-creds
+  # SeaweedFS uses these as admin credentials when no S3 config file is given;
+  # aws-cli reads the same names.
+  AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?missing, run make env}
+  AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?missing, run make env}
 
 services:
   # S3-compatible object storage. SeaweedFS stands in for S3 (MinIO no longer ships images).
   s3:
     image: chrislusf/seaweedfs:4.50
-    command: server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=8333
+    command: server -dir=/data -ip.bind=0.0.0.0 -master.telemetry=false -s3 -s3.port=8333
     environment:
-      # SeaweedFS falls back to these as admin credentials when no S3 config file is given.
-      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
-      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      <<: *s3-creds
     ports:
       - "127.0.0.1:9000:8333"   # S3 API
     volumes:
       - s3-data:/data
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8333"]
+      # /healthz answers once the S3 gateway is serving, not just when the port is open.
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8333/healthz"]
       interval: 5s
       timeout: 3s
       retries: 30
 
-  # One-shot: create the warehouse bucket, then exit.
+  # One-shot: create the warehouse bucket, then exit. Retries cover a filer that is
+  # still warming up right after the gateway turns healthy.
   s3-init:
     image: amazon/aws-cli:2.39.0
     depends_on:
       s3:
         condition: service_healthy
     environment:
-      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
-      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      <<: *s3-creds
       AWS_DEFAULT_REGION: us-east-1
-      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET:?missing, run make env}
     entrypoint: >
       /bin/sh -c "
-      aws --endpoint-url http://s3:8333 s3api head-bucket --bucket $${WAREHOUSE_BUCKET} 2>/dev/null ||
-      aws --endpoint-url http://s3:8333 s3api create-bucket --bucket $${WAREHOUSE_BUCKET}
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        aws --endpoint-url http://s3:8333 s3api head-bucket --bucket $${WAREHOUSE_BUCKET} 2>/dev/null && exit 0;
+        aws --endpoint-url http://s3:8333 s3api create-bucket --bucket $${WAREHOUSE_BUCKET} && exit 0;
+        echo 'bucket not ready, retrying'; sleep 2;
+      done; exit 1
       "
     restart: "no"
 
@@ -53,8 +65,12 @@ services:
     volumes:
       - pg-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      # Over TCP and against the `prefect` db: the entrypoint's temporary init server
+      # is socket-only, so this stays unhealthy until init.sql has run and the real
+      # server is listening.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d prefect"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -71,29 +87,35 @@ services:
       S3_ACCESS_KEY: ${S3_ACCESS_KEY}
       S3_SECRET_KEY: ${S3_SECRET_KEY}
       WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+      ICEBERG_CATALOG_NAME: ${ICEBERG_CATALOG_NAME:?missing, run make env}
     ports:
       - "127.0.0.1:8085:8080"
     volumes:
       - ./infra/trino/catalog:/etc/trino/catalog:ro
+    # The image's jvm.config gives the heap 80% of this limit.
     mem_limit: 3g
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "trino --execute 'SELECT 1' >/dev/null 2>&1"]
+      # The image's own lightweight check (curl on /v1/info), not a second CLI JVM.
+      test: ["CMD-SHELL", "/usr/lib/trino/bin/health-check"]
       interval: 10s
-      timeout: 10s
+      timeout: 5s
       retries: 30
 
   prefect-server:
-    image: prefecthq/prefect:3-python3.11
+    image: prefecthq/prefect:3.9.0-python3.11
     command: prefect server start --host 0.0.0.0
     depends_on:
       postgres:
         condition: service_healthy
     environment:
+      # Credentials go into a URL here: keep them URL-safe (no @ : / # %).
       PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/prefect
       PREFECT_SERVER_ANALYTICS_ENABLED: "false"
       PREFECT_UI_API_URL: http://localhost:4200/api
     ports:
       - "127.0.0.1:4200:4200"
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')\""]
       interval: 10s
